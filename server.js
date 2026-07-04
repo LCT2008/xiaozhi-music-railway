@@ -8,12 +8,16 @@
  * Protocol: MCP JSON-RPC 2.0 over WebSocket
  * Designed for Railway.app deployment (env PORT)
  */
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import Meting from './lib/meting/meting.js';
 
 // ─── Config ────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || '8765', 10);
 const HOST = process.env.HOST || '0.0.0.0';
+// When set, run as a CLIENT that dials OUT to the xiaozhi.me MCP access
+// point (Agent → MCP 接入点 → wss://api.xiaozhi.me/mcp/?token=…) instead of
+// listening for inbound connections. Required for the official cloud.
+const MCP_ENDPOINT = process.env.MCP_ENDPOINT || process.env.XIAOZHI_MCP_ENDPOINT || '';
 
 // ─── Meting client factory ──────────────────────────────────────
 function createClient(platform) {
@@ -195,6 +199,12 @@ const TOOLS = [
 async function handleMessage(data) {
   const { id, method, params = {} } = data;
 
+  // JSON-RPC notifications (e.g. "notifications/initialized") carry no id and
+  // must NOT receive a response. Returning null tells the transport to stay quiet.
+  if (id === undefined || id === null || (typeof method === 'string' && method.startsWith('notifications/'))) {
+    return null;
+  }
+
   try {
     switch (method) {
       case 'initialize':
@@ -245,39 +255,83 @@ async function handleMessage(data) {
   }
 }
 
-// ─── WebSocket server ───────────────────────────────────────────
-const wss = new WebSocketServer({ port: PORT, host: HOST });
+// Handle one raw WebSocket frame: parse JSON-RPC, dispatch, reply on the same
+// socket. Shared by both the inbound server and the outbound client transports.
+async function handleFrame(ws, raw) {
+  let data;
+  try {
+    data = JSON.parse(raw.toString());
+  } catch {
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: null,
+      error: { code: -32700, message: 'Parse error' }
+    }));
+    return;
+  }
 
-wss.on('connection', (ws, req) => {
-  const addr = req.socket.remoteAddress;
-  console.log(`[connect] ${addr}`);
+  const response = await handleMessage(data);
+  if (response) {
+    ws.send(JSON.stringify(response));
+  }
+}
 
-  ws.on('message', async (raw) => {
-    let data;
-    try {
-      data = JSON.parse(raw.toString());
-    } catch {
-      ws.send(JSON.stringify({
-        jsonrpc: '2.0', id: null,
-        error: { code: -32700, message: 'Parse error' }
-      }));
-      return;
-    }
+// ─── Mode 1: outbound client (official xiaozhi.me MCP access point) ──────────
+// Dials OUT to MCP_ENDPOINT and auto-reconnects. This is the model the official
+// cloud uses: it hands you a wss://…?token=… URL and your server connects to it.
+function startClient(endpoint) {
+  let backoff = 1000;
+  const MAX_BACKOFF = 30000;
 
-    const response = await handleMessage(data);
-    if (response) {
-      ws.send(JSON.stringify(response));
-    }
+  const connect = () => {
+    // Avoid logging the token in the URL.
+    const safe = endpoint.replace(/(token=)[^&]+/i, '$1***');
+    console.log(`[client] connecting to ${safe}`);
+    const ws = new WebSocket(endpoint);
+
+    ws.on('open', () => {
+      backoff = 1000;
+      console.log('[client] connected to xiaozhi MCP endpoint');
+    });
+
+    ws.on('message', (raw) => { handleFrame(ws, raw); });
+
+    ws.on('close', () => {
+      console.warn(`[client] disconnected — reconnecting in ${backoff}ms`);
+      setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, MAX_BACKOFF);
+    });
+
+    ws.on('error', (err) => {
+      console.error('[client] error:', err.message);
+      // 'close' fires after 'error' and drives the reconnect.
+    });
+  };
+
+  connect();
+  console.log(`[ready] client mode | Music MCP Server (Meting)`);
+  console.log(`[ready] Platforms: ${PLATFORMS.join(', ')}`);
+}
+
+// ─── Mode 2: inbound server (self-hosted / direct-connect setups) ────────────
+function startServer() {
+  const wss = new WebSocketServer({ port: PORT, host: HOST });
+
+  wss.on('connection', (ws, req) => {
+    const addr = req.socket.remoteAddress;
+    console.log(`[connect] ${addr}`);
+
+    ws.on('message', (raw) => { handleFrame(ws, raw); });
+    ws.on('close', () => { console.log(`[disconnect] ${addr}`); });
+    ws.on('error', (err) => { console.error(`[error] ${addr}:`, err.message); });
   });
 
-  ws.on('close', () => {
-    console.log(`[disconnect] ${addr}`);
-  });
+  console.log(`[ready] wss://${HOST}:${PORT}  |  Music MCP Server (Meting)`);
+  console.log(`[ready] Platforms: ${PLATFORMS.join(', ')}`);
+}
 
-  ws.on('error', (err) => {
-    console.error(`[error] ${addr}:`, err.message);
-  });
-});
-
-console.log(`[ready] wss://${HOST}:${PORT}  |  Music MCP Server (Meting)`);
-console.log(`[ready] Platforms: ${PLATFORMS.join(', ')}`);
+// ─── Boot ───────────────────────────────────────────────────────────────────
+if (MCP_ENDPOINT) {
+  startClient(MCP_ENDPOINT);
+} else {
+  startServer();
+}
